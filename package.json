@@ -1,5 +1,5 @@
 {
-  "name": "openclaw-mcp-bridge",
+  "name": "mcp-bridge",
   "version": "0.1.0",
   "description": "OpenClaw plugin that bridges MCP servers into native agent tools",
   "license": "MIT",
@@ -15,13 +15,13 @@
     "agent-tools",
     "plugin"
   ],
-  "openclaw": {
-    "extensions": ["./index.ts"]
-  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0"
   },
   "engines": {
     "node": ">=20"
+  },
+  "devDependencies": {
+    "jiti": "^2.6.1"
   }
 }

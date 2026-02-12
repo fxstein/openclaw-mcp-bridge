@@ -1,16 +1,19 @@
 /**
  * openclaw-mcp-bridge — Bridges MCP servers into native OpenClaw agent tools.
  *
- * For each configured MCP server, this plugin:
- * 1. Spawns the server process (stdio) or connects via HTTP/SSE
- * 2. Discovers available tools via MCP tools/list
- * 3. Registers each tool as a native OpenClaw agent tool
- * 4. Routes tool executions to the correct MCP server via tools/call
+ * Architecture:
+ * - Tool schemas are loaded from a pre-discovered cache (.mcp-tools-cache.json)
+ * - Tools are registered synchronously during plugin load (required by OpenClaw)
+ * - MCP server connections are established lazily on first tool call
+ * - Run `npx tsx discover.ts` to refresh the cache after adding/changing servers
  */
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-// SSE/Streamable HTTP transport — imported dynamically when needed
+import * as fs from "node:fs";
+import * as path from "node:path";
+
+// ---- Types ----
 
 interface ServerConfig {
   command?: string;
@@ -27,35 +30,36 @@ interface PluginConfig {
   optional?: boolean;
 }
 
-interface McpTool {
+interface CachedTool {
   name: string;
   description?: string;
   inputSchema?: Record<string, unknown>;
 }
 
-// Resolve ${ENV_VAR} references in strings
+interface CacheEntry {
+  server: string;
+  tools: CachedTool[];
+  discoveredAt: string;
+}
+
+interface Cache {
+  version: number;
+  servers: CacheEntry[];
+}
+
+// ---- Helpers ----
+
 function resolveEnvVars(value: string): string {
   return value.replace(/\$\{([^}]+)\}/g, (_match, varName) => {
     return process.env[varName] ?? "";
   });
 }
 
-function resolveEnvInArray(arr: string[]): string[] {
-  return arr.map(resolveEnvVars);
-}
-
-function resolveEnvInRecord(
-  rec: Record<string, string>
-): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(rec)) {
-    out[k] = resolveEnvVars(v);
-  }
-  return out;
-}
-
-// Sanitize MCP tool name into a valid OpenClaw tool name (snake_case, no dots/hyphens)
-function sanitizeToolName(serverName: string, toolName: string, prefix: boolean): string {
+function sanitizeToolName(
+  serverName: string,
+  toolName: string,
+  prefix: boolean
+): string {
   const sanitize = (s: string) =>
     s
       .replace(/[^a-zA-Z0-9_]/g, "_")
@@ -63,144 +67,154 @@ function sanitizeToolName(serverName: string, toolName: string, prefix: boolean)
       .replace(/^_|_$/g, "")
       .toLowerCase();
 
-  if (prefix) {
-    return `${sanitize(serverName)}_${sanitize(toolName)}`;
-  }
-  return sanitize(toolName);
+  return prefix
+    ? `${sanitize(serverName)}_${sanitize(toolName)}`
+    : sanitize(toolName);
 }
 
+function loadCache(pluginDir: string): Cache | null {
+  const cachePath = path.join(pluginDir, ".mcp-tools-cache.json");
+  try {
+    const raw = fs.readFileSync(cachePath, "utf-8");
+    const cache = JSON.parse(raw) as Cache;
+    if (cache.version !== 1 || !Array.isArray(cache.servers)) return null;
+    return cache;
+  } catch {
+    return null;
+  }
+}
+
+// ---- Plugin ----
+
 export default function register(api: any) {
-  const config: PluginConfig = api.config ?? {};
+  // api.config is the FULL openclaw config, not just the plugin config.
+  // Extract our plugin-specific config from the entries block.
+  const fullConfig = api.config ?? {};
+  const pluginEntry = fullConfig?.plugins?.entries?.["mcp-bridge"] ?? {};
+  const config: PluginConfig = pluginEntry.config ?? {};
   const servers = config.servers ?? {};
   const optionalTools = config.optional ?? false;
 
+  // Determine plugin directory
+  const pluginDir = path.dirname(
+    typeof __filename !== "undefined"
+      ? __filename
+      : new URL(import.meta.url).pathname
+  );
+
+  // Load cached tool schemas (synchronous — safe for plugin registration)
+  const cache = loadCache(pluginDir);
+
+  if (!cache || cache.servers.length === 0) {
+    api.logger.warn(
+      "mcp-bridge: no tool cache found. Run `npx tsx discover.ts` in the plugin directory to discover MCP tools."
+    );
+    return;
+  }
+
+  // Lazy connection pool
   const clients = new Map<string, Client>();
-  const transports = new Map<string, StdioClientTransport>();
+  const connecting = new Map<string, Promise<Client>>();
 
-  // Register a background service to manage MCP server lifecycles
-  api.registerService({
-    id: "mcp-bridge",
+  async function getClient(serverName: string): Promise<Client> {
+    const existing = clients.get(serverName);
+    if (existing) return existing;
 
-    async start() {
-      const enabledServers = Object.entries(servers).filter(
-        ([, cfg]) => cfg.enabled !== false
-      );
+    // Prevent duplicate connections
+    const pending = connecting.get(serverName);
+    if (pending) return pending;
 
-      if (enabledServers.length === 0) {
-        api.logger.info("mcp-bridge: no servers configured");
-        return;
-      }
+    const serverConfig = servers[serverName];
+    if (!serverConfig) {
+      throw new Error(`No config for MCP server '${serverName}'`);
+    }
 
-      api.logger.info(
-        `mcp-bridge: connecting to ${enabledServers.length} MCP server(s)...`
-      );
+    const promise = connectServer(serverName, serverConfig);
+    connecting.set(serverName, promise);
 
-      for (const [serverName, serverConfig] of enabledServers) {
-        try {
-          await connectServer(serverName, serverConfig);
-        } catch (err) {
-          api.logger.error(
-            `mcp-bridge: failed to connect to ${serverName}: ${err}`
-          );
-        }
-      }
-    },
-
-    async stop() {
-      for (const [name, client] of clients) {
-        try {
-          await client.close();
-          api.logger.info(`mcp-bridge: disconnected from ${name}`);
-        } catch (err) {
-          api.logger.warn(`mcp-bridge: error closing ${name}: ${err}`);
-        }
-      }
-      for (const [, transport] of transports) {
-        try {
-          await transport.close();
-        } catch {
-          // ignore
-        }
-      }
-      clients.clear();
-      transports.clear();
-    },
-  });
+    try {
+      const client = await promise;
+      clients.set(serverName, client);
+      return client;
+    } finally {
+      connecting.delete(serverName);
+    }
+  }
 
   async function connectServer(
     serverName: string,
     serverConfig: ServerConfig
-  ) {
+  ): Promise<Client> {
     const client = new Client(
       { name: `openclaw-mcp-bridge/${serverName}`, version: "0.1.0" },
       { capabilities: { tools: {} } }
     );
 
-    let transport: any;
-
     if (serverConfig.command) {
-      // Stdio transport
-      const resolvedArgs = serverConfig.args
-        ? resolveEnvInArray(serverConfig.args)
-        : [];
-      const resolvedEnv = serverConfig.env
-        ? resolveEnvInRecord(serverConfig.env)
-        : {};
+      const resolvedArgs = (serverConfig.args ?? []).map(resolveEnvVars);
+      const resolvedEnv: Record<string, string> = {};
+      if (serverConfig.env) {
+        for (const [k, v] of Object.entries(serverConfig.env)) {
+          resolvedEnv[k] = resolveEnvVars(v);
+        }
+      }
 
-      transport = new StdioClientTransport({
+      const transport = new StdioClientTransport({
         command: resolveEnvVars(serverConfig.command),
         args: resolvedArgs,
         env: { ...process.env, ...resolvedEnv } as Record<string, string>,
       });
 
-      transports.set(serverName, transport);
+      await client.connect(transport);
     } else if (serverConfig.url) {
-      // HTTP/SSE transport — use Streamable HTTP with SSE fallback
       const { SSEClientTransport } = await import(
         "@modelcontextprotocol/sdk/client/sse.js"
       );
       const resolvedUrl = resolveEnvVars(serverConfig.url);
-      const resolvedHeaders = serverConfig.headers
-        ? resolveEnvInRecord(serverConfig.headers)
-        : {};
+      const resolvedHeaders: Record<string, string> = {};
+      if (serverConfig.headers) {
+        for (const [k, v] of Object.entries(serverConfig.headers)) {
+          resolvedHeaders[k] = resolveEnvVars(v);
+        }
+      }
 
-      transport = new SSEClientTransport(new URL(resolvedUrl), {
-        requestInit: {
-          headers: resolvedHeaders,
-        },
+      const transport = new SSEClientTransport(new URL(resolvedUrl), {
+        requestInit: { headers: resolvedHeaders },
       });
+
+      await client.connect(transport);
     } else {
-      throw new Error(
-        `Server ${serverName}: must specify either 'command' or 'url'`
-      );
+      throw new Error(`Server ${serverName}: must specify 'command' or 'url'`);
     }
 
-    await client.connect(transport);
-    clients.set(serverName, client);
+    api.logger.info(`mcp-bridge: connected to ${serverName}`);
+    return client;
+  }
 
-    // Discover tools
-    const toolsResult = await client.listTools();
-    const tools: McpTool[] = toolsResult.tools ?? [];
+  // Register tools from cache (synchronous — this is the critical part)
+  let totalTools = 0;
 
-    api.logger.info(
-      `mcp-bridge: ${serverName} — discovered ${tools.length} tool(s)`
-    );
+  for (const cacheEntry of cache.servers) {
+    const serverName = cacheEntry.server;
+    const serverConfig = servers[serverName];
+
+    if (!serverConfig || serverConfig.enabled === false) {
+      continue; // skip servers not in current config
+    }
 
     const prefix = serverConfig.toolPrefix !== false;
 
-    // Register each tool as a native OpenClaw agent tool
-    for (const tool of tools) {
+    for (const tool of cacheEntry.tools) {
       const toolName = sanitizeToolName(serverName, tool.name, prefix);
-      const mcpToolName = tool.name; // preserve original for MCP calls
+      const mcpToolName = tool.name;
 
       const description = [
         tool.description ?? `MCP tool from ${serverName}`,
-        prefix ? `(MCP: ${serverName}/${mcpToolName})` : `(MCP: ${serverName})`,
+        `(MCP: ${serverName}/${mcpToolName})`,
       ].join(" ");
 
-      // Convert MCP input schema to OpenClaw-compatible JSON Schema
       const parameters = tool.inputSchema ?? {
-        type: "object",
+        type: "object" as const,
         properties: {},
       };
 
@@ -210,27 +224,17 @@ export default function register(api: any) {
           description,
           parameters,
 
-          async execute(_toolCallId: string, params: Record<string, unknown>) {
-            const serverClient = clients.get(serverName);
-            if (!serverClient) {
-              return {
-                content: [
-                  {
-                    type: "text" as const,
-                    text: `Error: MCP server '${serverName}' is not connected`,
-                  },
-                ],
-                isError: true,
-              };
-            }
-
+          async execute(
+            _toolCallId: string,
+            params: Record<string, unknown>
+          ) {
             try {
-              const result = await serverClient.callTool({
+              const client = await getClient(serverName);
+              const result = await client.callTool({
                 name: mcpToolName,
                 arguments: params,
               });
 
-              // MCP returns content array — pass through directly
               return {
                 content: (result.content as any[]) ?? [
                   { type: "text", text: JSON.stringify(result) },
@@ -252,6 +256,29 @@ export default function register(api: any) {
         },
         { optional: optionalTools }
       );
+
+      totalTools++;
     }
   }
+
+  api.logger.info(
+    `mcp-bridge: registered ${totalTools} tool(s) from ${cache.servers.length} server(s)`
+  );
+
+  // Service for cleanup on shutdown
+  api.registerService({
+    id: "mcp-bridge",
+    start: async () => {},
+    stop: async () => {
+      for (const [name, client] of clients) {
+        try {
+          await client.close();
+          api.logger.info(`mcp-bridge: disconnected from ${name}`);
+        } catch {
+          // ignore
+        }
+      }
+      clients.clear();
+    },
+  });
 }
