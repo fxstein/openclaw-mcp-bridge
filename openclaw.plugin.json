@@ -1,0 +1,73 @@
+{
+  "id": "mcp-bridge",
+  "name": "MCP Bridge",
+  "description": "Bridges MCP (Model Context Protocol) servers into native OpenClaw agent tools",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "servers": {
+        "type": "object",
+        "description": "MCP server definitions keyed by server name",
+        "additionalProperties": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string",
+              "description": "Command to spawn the MCP server (stdio transport)"
+            },
+            "args": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Arguments for the server command"
+            },
+            "env": {
+              "type": "object",
+              "additionalProperties": { "type": "string" },
+              "description": "Environment variables for the server process"
+            },
+            "url": {
+              "type": "string",
+              "description": "URL for HTTP/SSE transport (alternative to command)"
+            },
+            "headers": {
+              "type": "object",
+              "additionalProperties": { "type": "string" },
+              "description": "HTTP headers for URL-based transport"
+            },
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Enable or disable this server"
+            },
+            "toolPrefix": {
+              "type": "boolean",
+              "default": true,
+              "description": "Prefix tool names with server name (e.g. ai_todo_list_tasks)"
+            }
+          },
+          "anyOf": [
+            { "required": ["command"] },
+            { "required": ["url"] }
+          ]
+        }
+      },
+      "optional": {
+        "type": "boolean",
+        "default": false,
+        "description": "Register tools as optional (require allowlist to enable)"
+      }
+    }
+  },
+  "uiHints": {
+    "servers": {
+      "label": "MCP Servers",
+      "help": "Define MCP servers to bridge into agent tools. Each server's tools become native OpenClaw tools."
+    },
+    "optional": {
+      "label": "Optional Tools",
+      "help": "If true, tools require explicit allowlist to be available to agents."
+    }
+  }
+}
