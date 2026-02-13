@@ -228,29 +228,39 @@ export default function register(api: any) {
             _toolCallId: string,
             params: Record<string, unknown>
           ) {
-            try {
-              const client = await getClient(serverName);
-              const result = await client.callTool({
-                name: mcpToolName,
-                arguments: params,
-              });
+            for (let attempt = 0; attempt < 2; attempt++) {
+              try {
+                const client = await getClient(serverName);
+                const result = await client.callTool({
+                  name: mcpToolName,
+                  arguments: params,
+                });
 
-              return {
-                content: (result.content as any[]) ?? [
-                  { type: "text", text: JSON.stringify(result) },
-                ],
-                isError: result.isError === true,
-              };
-            } catch (err: any) {
-              return {
-                content: [
-                  {
-                    type: "text" as const,
-                    text: `MCP error (${serverName}/${mcpToolName}): ${err.message ?? String(err)}`,
-                  },
-                ],
-                isError: true,
-              };
+                return {
+                  content: (result.content as any[]) ?? [
+                    { type: "text", text: JSON.stringify(result) },
+                  ],
+                  isError: result.isError === true,
+                };
+              } catch (err: any) {
+                if (attempt === 0) {
+                  // Connection may be dead — drop it and retry with a fresh one
+                  clients.delete(serverName);
+                  api.logger.warn(
+                    `mcp-bridge: ${serverName}/${mcpToolName} failed, retrying with fresh connection`
+                  );
+                  continue;
+                }
+                return {
+                  content: [
+                    {
+                      type: "text" as const,
+                      text: `MCP error (${serverName}/${mcpToolName}): ${err.message ?? String(err)}`,
+                    },
+                  ],
+                  isError: true,
+                };
+              }
             }
           },
         },
