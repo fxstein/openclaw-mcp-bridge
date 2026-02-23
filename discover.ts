@@ -117,6 +117,7 @@ async function main() {
   } else {
     // Try to read from openclaw.json
     const openclawPaths = [
+      ...(process.env.OPENCLAW_CONFIG_PATH ? [process.env.OPENCLAW_CONFIG_PATH] : []),
       path.join(process.env.HOME ?? "", ".openclaw", "openclaw.json"),
       "openclaw.json",
     ];
