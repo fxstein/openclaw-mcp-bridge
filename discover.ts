@@ -13,14 +13,13 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
-
-interface ServerConfig {
-  command?: string;
-  args?: string[];
-  env?: Record<string, string>;
-  enabled?: boolean;
-  toolPrefix?: boolean;
-}
+import { pathToFileURL } from "node:url";
+import {
+  connectUrlTransport,
+  getTransportMode,
+  resolveEnvVars,
+  type ServerConfig,
+} from "./index.js";
 
 interface CachedTool {
   name: string;
@@ -39,41 +38,53 @@ interface Cache {
   servers: CacheEntry[];
 }
 
-function resolveEnvVars(value: string): string {
-  return value.replace(/\$\{([^}]+)\}/g, (_match, varName) => {
-    return process.env[varName] ?? "";
-  });
+export function getEnabledServers(
+  servers: Record<string, ServerConfig>
+): Array<[string, ServerConfig]> {
+  return Object.entries(servers).filter(([, cfg]) => cfg.enabled !== false);
 }
 
 async function discoverServer(
   serverName: string,
   config: ServerConfig
 ): Promise<CacheEntry> {
-  if (!config.command) {
-    throw new Error(`Server ${serverName}: only stdio servers supported for discovery`);
-  }
-
-  const resolvedArgs = (config.args ?? []).map(resolveEnvVars);
-  const resolvedEnv: Record<string, string> = {};
-  if (config.env) {
-    for (const [k, v] of Object.entries(config.env)) {
-      resolvedEnv[k] = resolveEnvVars(v);
-    }
-  }
-
-  const transport = new StdioClientTransport({
-    command: resolveEnvVars(config.command),
-    args: resolvedArgs,
-    env: { ...process.env, ...resolvedEnv } as Record<string, string>,
-  });
-
   const client = new Client(
     { name: "mcp-bridge-discover", version: "0.1.0" },
     { capabilities: { tools: {} } }
   );
 
+  let stdioTransport: StdioClientTransport | undefined;
+
   try {
-    await client.connect(transport);
+    if (config.command) {
+      const resolvedArgs = (config.args ?? []).map(resolveEnvVars);
+      const resolvedEnv: Record<string, string> = {};
+      if (config.env) {
+        for (const [k, v] of Object.entries(config.env)) {
+          resolvedEnv[k] = resolveEnvVars(v);
+        }
+      }
+
+      stdioTransport = new StdioClientTransport({
+        command: resolveEnvVars(config.command),
+        args: resolvedArgs,
+        env: { ...process.env, ...resolvedEnv } as Record<string, string>,
+      });
+
+      await client.connect(stdioTransport);
+      console.log(`  ${serverName}: connected via stdio`);
+    } else if (config.url) {
+      await connectUrlTransport(client, serverName, config, {
+        info: (msg: string) => console.log(`  ${msg}`),
+        warn: (msg: string) => console.warn(`  ${msg}`),
+      });
+      console.log(
+        `  ${serverName}: discovered over URL transport (${getTransportMode(config)})`
+      );
+    } else {
+      throw new Error(`Server ${serverName}: must specify 'command' or 'url'`);
+    }
+
     const result = await client.listTools();
     const tools: CachedTool[] = (result.tools ?? []).map((t) => ({
       name: t.name,
@@ -97,10 +108,12 @@ async function discoverServer(
     } catch {
       // ignore
     }
-    try {
-      await transport.close();
-    } catch {
-      // ignore
+    if (stdioTransport) {
+      try {
+        await stdioTransport.close();
+      } catch {
+        // ignore
+      }
     }
   }
 }
@@ -135,9 +148,7 @@ async function main() {
     }
   }
 
-  const enabledServers = Object.entries(servers).filter(
-    ([, cfg]) => cfg.enabled !== false
-  );
+  const enabledServers = getEnabledServers(servers);
 
   if (enabledServers.length === 0) {
     console.error("No MCP servers configured. Pass --config or configure in openclaw.json.");
@@ -163,7 +174,13 @@ async function main() {
   console.log(`Total: ${cache.servers.reduce((n, s) => n + s.tools.length, 0)} tool(s) from ${cache.servers.length} server(s)`);
 }
 
-main().catch((err) => {
-  console.error("Fatal:", err);
-  process.exit(1);
-});
+const isMain =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isMain) {
+  main().catch((err) => {
+    console.error("Fatal:", err);
+    process.exit(1);
+  });
+}

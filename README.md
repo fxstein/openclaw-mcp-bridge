@@ -46,12 +46,19 @@ Add your MCP servers to `openclaw.json`:
               ]
             },
 
-            // HTTP/SSE server (direct URL connection)
+            // URL server (auto transport: Streamable HTTP -> SSE fallback)
             "my-api": {
               url: "https://api.example.com/mcp",
+              transport: "auto",
               headers: {
                 "Authorization": "Bearer ${API_KEY}"
               }
+            },
+
+            // QMD / Streamable HTTP server
+            "qmd": {
+              url: "http://[::1]:3000/mcp",
+              transport: "streamable-http"
             }
           }
         }
@@ -72,12 +79,23 @@ Each server entry supports:
 | `command` | `string` | Command to spawn (stdio transport) |
 | `args` | `string[]` | Arguments for the command |
 | `env` | `object` | Extra environment variables for the process |
-| `url` | `string` | URL for HTTP/SSE transport (alternative to command) |
+| `url` | `string` | Full MCP URL for HTTP transport (alternative to command) |
+| `transport` | `"auto" \| "streamable-http" \| "sse"` | URL transport mode (default: `"auto"`) |
 | `headers` | `object` | HTTP headers for URL transport |
 | `enabled` | `boolean` | Enable/disable this server (default: `true`) |
 | `toolPrefix` | `boolean` | Prefix tool names with server name (default: `true`) |
 
 Either `command` or `url` is required.
+
+### URL Transport Modes
+
+For URL-based servers, `transport` supports:
+
+- `"auto"` (default): try Streamable HTTP first, then fall back to SSE
+- `"streamable-http"`: only Streamable HTTP (fail fast if unsupported)
+- `"sse"`: only SSE (backward compatibility)
+
+`url` must be the full MCP endpoint (for example `https://host.example/mcp`).
 
 ### Environment Variable Resolution
 
@@ -142,6 +160,19 @@ npm install
 openclaw plugins install -l .
 openclaw gateway restart
 ```
+
+### Discover MCP tools (cache refresh)
+
+Run discovery whenever server tools change:
+
+```bash
+npx tsx discover.ts
+```
+
+Discovery now supports both:
+
+- stdio servers (`command` + `args`)
+- URL servers (`url`) with the same `transport` behavior (`auto`, `streamable-http`, `sse`)
 
 ## License
 

@@ -15,7 +15,9 @@ import * as path from "node:path";
 
 // ---- Types ----
 
-interface ServerConfig {
+export type TransportMode = "streamable-http" | "sse" | "auto";
+
+export interface ServerConfig {
   command?: string;
   args?: string[];
   env?: Record<string, string>;
@@ -23,6 +25,7 @@ interface ServerConfig {
   headers?: Record<string, string>;
   enabled?: boolean;
   toolPrefix?: boolean;
+  transport?: TransportMode;
 }
 
 interface PluginConfig {
@@ -49,13 +52,13 @@ interface Cache {
 
 // ---- Helpers ----
 
-function resolveEnvVars(value: string): string {
+export function resolveEnvVars(value: string): string {
   return value.replace(/\$\{([^}]+)\}/g, (_match, varName) => {
     return process.env[varName] ?? "";
   });
 }
 
-function sanitizeToolName(
+export function sanitizeToolName(
   serverName: string,
   toolName: string,
   prefix: boolean
@@ -81,6 +84,79 @@ function loadCache(pluginDir: string): Cache | null {
     return cache;
   } catch {
     return null;
+  }
+}
+
+export function getTransportMode(serverConfig: ServerConfig): TransportMode {
+  return serverConfig.transport ?? "auto";
+}
+
+function resolveHeaders(headers?: Record<string, string>): Record<string, string> {
+  const resolvedHeaders: Record<string, string> = {};
+  if (!headers) {
+    return resolvedHeaders;
+  }
+
+  for (const [k, v] of Object.entries(headers)) {
+    resolvedHeaders[k] = resolveEnvVars(v);
+  }
+
+  return resolvedHeaders;
+}
+
+export async function connectUrlTransport(
+  client: Client,
+  serverName: string,
+  serverConfig: ServerConfig,
+  logger: { info: (msg: string) => void; warn: (msg: string) => void }
+): Promise<void> {
+  const resolvedUrl = resolveEnvVars(serverConfig.url ?? "");
+  const resolvedHeaders = resolveHeaders(serverConfig.headers);
+  const mode = getTransportMode(serverConfig);
+
+  const connectStreamable = async (): Promise<void> => {
+    const { StreamableHTTPClientTransport } = await import(
+      "@modelcontextprotocol/sdk/client/streamableHttp.js"
+    );
+
+    const transport = new StreamableHTTPClientTransport(new URL(resolvedUrl), {
+      requestInit: { headers: resolvedHeaders },
+    });
+
+    await client.connect(transport);
+    logger.info(`mcp-bridge: ${serverName} connected via streamable-http`);
+  };
+
+  const connectSse = async (): Promise<void> => {
+    const { SSEClientTransport } = await import(
+      "@modelcontextprotocol/sdk/client/sse.js"
+    );
+
+    const transport = new SSEClientTransport(new URL(resolvedUrl), {
+      requestInit: { headers: resolvedHeaders },
+    });
+
+    await client.connect(transport);
+    logger.info(`mcp-bridge: ${serverName} connected via sse`);
+  };
+
+  if (mode === "sse") {
+    await connectSse();
+    return;
+  }
+
+  if (mode === "streamable-http") {
+    await connectStreamable();
+    return;
+  }
+
+  try {
+    await connectStreamable();
+  } catch (err: any) {
+    logger.warn(
+      `mcp-bridge: ${serverName} streamable-http failed (${err?.message ?? String(err)}), falling back to sse`
+    );
+    await connectSse();
   }
 }
 
@@ -167,22 +243,7 @@ export default function register(api: any) {
 
       await client.connect(transport);
     } else if (serverConfig.url) {
-      const { SSEClientTransport } = await import(
-        "@modelcontextprotocol/sdk/client/sse.js"
-      );
-      const resolvedUrl = resolveEnvVars(serverConfig.url);
-      const resolvedHeaders: Record<string, string> = {};
-      if (serverConfig.headers) {
-        for (const [k, v] of Object.entries(serverConfig.headers)) {
-          resolvedHeaders[k] = resolveEnvVars(v);
-        }
-      }
-
-      const transport = new SSEClientTransport(new URL(resolvedUrl), {
-        requestInit: { headers: resolvedHeaders },
-      });
-
-      await client.connect(transport);
+      await connectUrlTransport(client, serverName, serverConfig, api.logger);
     } else {
       throw new Error(`Server ${serverName}: must specify 'command' or 'url'`);
     }
