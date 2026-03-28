@@ -297,10 +297,24 @@ export default function register(api: any) {
                   arguments: params,
                 });
 
+                // Normalize content: OC only renders type:"text" and type:"image".
+                // MCP servers may return type:"resource" (embedded resources) which
+                // OC silently drops. Unwrap resource content into text.
+                const rawContent = (result.content as any[]) ?? [];
+                const normalizedContent = rawContent.map((item: any) => {
+                  if (item.type === "resource" && item.resource) {
+                    return {
+                      type: "text" as const,
+                      text: item.resource.text ?? JSON.stringify(item.resource),
+                    };
+                  }
+                  return item;
+                });
+
                 return {
-                  content: (result.content as any[]) ?? [
-                    { type: "text", text: JSON.stringify(result) },
-                  ],
+                  content: normalizedContent.length > 0
+                    ? normalizedContent
+                    : [{ type: "text", text: JSON.stringify(result) }],
                   isError: result.isError === true,
                 };
               } catch (err: any) {
